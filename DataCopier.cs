@@ -12,6 +12,22 @@ namespace CloneDataBase
             int copied = 0;
             int offset = 0;
 
+            // Obter o schema das colunas da tabela de origem
+            Dictionary<string, string> columnTypes;
+            using (var conn = new SqlConnection(srcConn))
+            {
+                conn.Open();
+                using var cmd = new SqlCommand(
+                    @"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @table", conn);
+                cmd.Parameters.AddWithValue("@table", table);
+                using var reader = cmd.ExecuteReader();
+                columnTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                while (reader.Read())
+                {
+                    columnTypes[reader.GetString(0)] = reader.GetString(1);
+                }
+            }
+
             while (offset < total && !cancelRequested)
             {
                 var batch = new List<Dictionary<string, object>>();
@@ -39,7 +55,35 @@ namespace CloneDataBase
                                     value = minSqlDate;
                                 }
                             }
-                            row[reader.GetName(i)] = value;
+                            // Corrigir: garantir que varbinary seja byte[]
+                            string colName = reader.GetName(i);
+                            if (columnTypes.TryGetValue(colName, out var type) && type.StartsWith("varbinary", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (value == DBNull.Value)
+                                {
+                                    row[colName] = DBNull.Value;
+                                }
+                                else if (value is byte[] bytes)
+                                {
+                                    row[colName] = bytes;
+                                }
+                                else
+                                {
+                                    // Tenta converter para byte[]
+                                    try
+                                    {
+                                        row[colName] = Convert.FromBase64String(value.ToString() ?? "");
+                                    }
+                                    catch
+                                    {
+                                        row[colName] = DBNull.Value;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                row[colName] = value;
+                            }
                         }
                         batch.Add(row);
                     }
@@ -74,7 +118,20 @@ namespace CloneDataBase
                             using (var insertCmd = new SqlCommand(insertSql, connection))
                             {
                                 foreach (var kv in row)
-                                    insertCmd.Parameters.AddWithValue("@" + kv.Key, kv.Value ?? DBNull.Value);
+                                {
+                                    // Corrigir: garantir que varbinary seja byte[] no parâmetro
+                                    if (columnTypes.TryGetValue(kv.Key, out var type) && type.StartsWith("varbinary", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        if (kv.Value == DBNull.Value)
+                                            insertCmd.Parameters.Add($"@{kv.Key}", System.Data.SqlDbType.VarBinary).Value = DBNull.Value;
+                                        else
+                                            insertCmd.Parameters.Add($"@{kv.Key}", System.Data.SqlDbType.VarBinary).Value = kv.Value;
+                                    }
+                                    else
+                                    {
+                                        insertCmd.Parameters.AddWithValue("@" + kv.Key, kv.Value ?? DBNull.Value);
+                                    }
+                                }
                                 insertCmd.ExecuteNonQuery();
                             }
                             copied++;
